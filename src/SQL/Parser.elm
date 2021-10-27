@@ -1,12 +1,22 @@
-module SQL.Parser exposing (..)
+module SQL.Parser exposing
+    ( Column
+    , CreateTable
+    , Type(..)
+    , column
+    , columnConstraint
+    , createTable
+    , default
+    , schema
+    )
 
 import Char exposing (isAlpha)
-import Parser exposing ((|.), (|=), Parser, Trailing(..), backtrackable, int, keyword, map, oneOf, sequence, spaces, succeed, symbol, variable)
+import Parser exposing ((|.), (|=), Nestable(..), Parser, Trailing(..), backtrackable, chompWhile, getChompedString, int, keyword, oneOf, sequence, spaces, succeed, symbol, variable)
 import Set exposing (Set)
 
 
 type alias CreateTable =
-    { schema : Maybe String
+    { ifNotExist : Bool
+    , schema : Maybe String
     , name : String
     , columns : List Column
     }
@@ -15,14 +25,19 @@ type alias CreateTable =
 type alias Column =
     { name : String
     , type_ : Type
+    , identity : Maybe ( Int, Int )
     , isNotNull : Bool
+    , constraint : Maybe String
     , isPrimaryKey : Bool
+    , default : Maybe String
+    , columnReferences : Maybe String
     }
 
 
 type Type
     = Int
     | Text
+    | Varchar (Maybe Int)
     | CharacterVarying Int
     | Other String
 
@@ -33,37 +48,54 @@ createTable =
         |. spaces
         |. keyword "CREATE TABLE"
         |. spaces
-        |. tableIfNotExists
+        |= tableIfNotExists
         |. spaces
         |= schema
         |= tableName
         |. spaces
-        |= sequence
-            { start = "("
-            , separator = ","
-            , end = ")"
-            , spaces = spaces
-            , item = column
-            , trailing = Forbidden
-            }
+        |= columns
         |. symbol ";"
+
+
+columns : Parser (List Column)
+columns =
+    sequence
+        { start = "("
+        , separator = ","
+        , end = ")"
+        , spaces = spaces
+        , item = column
+        , trailing = Forbidden
+        }
 
 
 tableIfNotExists : Parser Bool
 tableIfNotExists =
+    bool <| keyword "IF NOT EXISTS"
+
+
+bool : Parser () -> Parser Bool
+bool p =
     oneOf
-        [ succeed True |. keyword "IF NOT EXISTS"
+        [ succeed True |. p
         , succeed False
         ]
 
 
 tableName : Parser String
 tableName =
-    variable
-        { start = isAlpha
-        , inner = isAlpha
-        , reserved = Set.empty
-        }
+    let
+        name =
+            variable
+                { start = isAlpha
+                , inner = isAlpha
+                , reserved = Set.empty
+                }
+    in
+    oneOf
+        [ quoted "[" "]" name
+        , name
+        ]
 
 
 schema : Parser (Maybe String)
@@ -88,24 +120,38 @@ column =
         |. spaces
         |= columnType
         |. spaces
+        |= columnIdentity
+        |. spaces
         |= columnIsNotNull
         |. spaces
+        |= columnConstraint
+        |. spaces
         |= columnIsPrimaryKey
+        |. spaces
+        |= default
+        |. spaces
+        |= columnReferences
+        |. spaces
 
 
 columnName : Parser String
 columnName =
     let
+        isColumnNameChar c =
+            isAlpha c || c == '_'
+
         name =
             variable
                 { start = isAlpha
-                , inner = isAlpha
+                , inner = isColumnNameChar
                 , reserved = Set.fromList []
                 }
     in
     oneOf
         [ quoted "'" "'" name
         , quoted "`" "`" name
+        , quoted "[" "]" name
+        , quoted "\"" "\"" name
         , name
         ]
 
@@ -121,17 +167,24 @@ quoted start end stringParser =
 columnType : Parser Type
 columnType =
     oneOf
-        [ map (\_ -> Int) <| keyword "INT"
-        , map (\_ -> Text) <| keyword "TEXT"
-        , map (\count -> CharacterVarying count) <|
-            (succeed identity
-                |. keyword "CHARACTER VARYING"
-                |. symbol "("
-                |= int
-                |. symbol ")"
-            )
-        , map (\typeName -> Other typeName) <|
-            variable
+        [ succeed Int |. keyword "INT"
+        , succeed Text |. keyword "TEXT"
+        , succeed Varchar
+            |. keyword "VARCHAR"
+            |= oneOf
+                [ succeed Just
+                    |. symbol "("
+                    |= int
+                    |. symbol ")"
+                , succeed Nothing
+                ]
+        , succeed CharacterVarying
+            |. keyword "CHARACTER VARYING"
+            |. symbol "("
+            |= int
+            |. symbol ")"
+        , succeed Other
+            |= variable
                 { start = isAlpha
                 , inner = isAlpha
                 , reserved = Set.empty
@@ -141,17 +194,97 @@ columnType =
 
 columnIsNotNull : Parser Bool
 columnIsNotNull =
-    oneOf
-        [ succeed True |. keyword "NOT NULL"
-        , succeed False
-        ]
+    bool <| keyword "NOT NULL"
 
 
 columnIsPrimaryKey : Parser Bool
 columnIsPrimaryKey =
+    bool <| keyword "PRIMARY KEY"
+
+
+
+-- type ConflictClause
+--     = Rollback
+--     | Abort
+--     | Fail
+--     | Ignore
+--     | Replace
+-- conflictClause : Parser ConflictClause
+-- conflictClause =
+--     succeed identity
+--         |. keyword "ON CONFLICT"
+--         |. spaces
+--         |= oneOf
+--             [ succeed Rollback |. keyword "ROLLBACK"
+--             , succeed Abort |. keyword "ABORT"
+--             , succeed Fail |. keyword "FAIL"
+--             , succeed Ignore |. keyword "IGNORE"
+--             , succeed Replace |. keyword "REPLACE"
+--             ]
+
+
+columnConstraint : Parser (Maybe String)
+columnConstraint =
+    let
+        isConstraintChar c =
+            isAlpha c || c == '_'
+    in
     oneOf
-        [ succeed True |. keyword "PRIMARY KEY"
-        , succeed False
+        [ succeed Just
+            |. keyword "CONSTRAINT"
+            |. spaces
+            |= variable { start = isAlpha, inner = isConstraintChar, reserved = Set.empty }
+        , succeed Nothing
+        ]
+
+
+default : Parser (Maybe String)
+default =
+    oneOf
+        [ succeed Just
+            |. keyword "DEFAULT"
+            |. spaces
+            |. symbol "'"
+            |= getChompedString (chompWhile (\c -> c /= '\''))
+            |. symbol "'"
+        , succeed Nothing
+        ]
+
+
+columnIdentity : Parser (Maybe ( Int, Int ))
+columnIdentity =
+    oneOf
+        [ succeed (\start increment -> Just ( start, increment ))
+            |. keyword "identity"
+            |. symbol "("
+            |. spaces
+            |= int
+            |. spaces
+            |. symbol ","
+            |. spaces
+            |= int
+            |. spaces
+            |. symbol ")"
+        , succeed Nothing
+        ]
+
+
+columnReferences : Parser (Maybe String)
+columnReferences =
+    let
+        isReferencesChar c =
+            isAlpha c || c == '.'
+    in
+    oneOf
+        [ succeed Just
+            |. keyword "REFERENCES"
+            |. spaces
+            |= variable
+                { start = isAlpha
+                , inner = isReferencesChar
+                , reserved = Set.empty
+                }
+        , succeed Nothing
         ]
 
 
